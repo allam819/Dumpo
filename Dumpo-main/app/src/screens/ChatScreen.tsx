@@ -1,0 +1,187 @@
+import React, { useRef, useState, useEffect } from 'react';
+import { View, Text, StyleSheet, FlatList, Image, ActivityIndicator, KeyboardAvoidingView, Platform } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { MessageBubble } from '../components/chat/MessageBubble';
+import { ChatInput } from '../components/chat/ChatInput';
+import { BucketBottomSheet } from '../components/shared/BucketBottomSheet';
+import { useChat } from '../hooks/useChat';
+import { useAuthStore } from '../store/authStore';
+
+export function ChatScreen() {
+  const { messages, isLoading, hasMore, sendMessage, fetchMessages, reclassifyMessageItem } = useChat();
+  const { user } = useAuthStore();
+  
+  const [sheetVisible, setSheetVisible] = useState(false);
+  const [selectedItemInfo, setSelectedItemInfo] = useState<{ messageId: string; currentBucket: string } | null>(null);
+  
+  const flatListRef = useRef<FlatList>(null);
+
+  // Send message - inverted FlatList automatically anchors to bottom at index 0
+  const handleSend = (text: string) => {
+    sendMessage(text);
+  };
+
+  const handleLoadMore = () => {
+    if (hasMore && !isLoading) {
+      fetchMessages(true, true);
+    }
+  };
+
+  const handleTapTag = (bucketKey: string, messageId: string) => {
+    setSelectedItemInfo({
+      messageId,
+      currentBucket: bucketKey
+    });
+    setSheetVisible(true);
+  };
+
+  const handleSelectReclassify = (toBucket: string) => {
+    if (selectedItemInfo) {
+      reclassifyMessageItem(
+        selectedItemInfo.messageId,
+        toBucket
+      );
+      setSelectedItemInfo(null);
+    }
+  };
+
+  const userAvatar = user?.user_metadata?.avatar_url || `https://avatar.vercel.sh/${user?.email || 'dumpo'}`;
+
+  return (
+    <SafeAreaView style={styles.safeContainer}>
+      <KeyboardAvoidingView
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        style={styles.keyboardContainer}
+      >
+        {/* 1. Custom WhatsApp-Style Header */}
+        <View style={styles.header}>
+          <Image 
+            source={{ uri: 'https://avatar.vercel.sh/dumpo.png' }} 
+            style={styles.avatar} 
+          />
+          <View style={styles.headerInfo}>
+            <Text style={styles.headerTitle}>Dumpo</Text>
+            <Text style={styles.headerStatus}>AI Assistant</Text>
+          </View>
+        </View>
+
+        {/* 2. Messages List */}
+        {isLoading && messages.length === 0 ? (
+          <View style={styles.historyLoader}>
+            <ActivityIndicator color="#a855f7" size="large" />
+            <Text style={styles.historyLoaderText}>Loading chat history...</Text>
+          </View>
+        ) : (
+          <FlatList
+            ref={flatListRef}
+            data={[...messages].reverse()}
+            keyExtractor={(item) => item.id}
+            keyboardShouldPersistTaps="handled"
+            inverted
+            onEndReached={handleLoadMore}
+            onEndReachedThreshold={0.5}
+            renderItem={({ item }) => (
+              <MessageBubble 
+                message={item} 
+                onTapTag={() => handleTapTag(item.items?.[0]?.primary_bucket || "others", item.id)}
+              />
+            )}
+            contentContainerStyle={styles.messagesList}
+            ListFooterComponent={isLoading && messages.length > 0 ? (
+              <View style={styles.loaderContainer}>
+                <ActivityIndicator color="#a855f7" size="small" />
+                <Text style={styles.loaderText}>Dumpo is processing...</Text>
+              </View>
+            ) : null}
+          />
+        )}
+
+        {/* 3. Input Bar */}
+        <ChatInput onSend={handleSend} disabled={isLoading} />
+
+        {/* 4. Bottom Sheet Modal */}
+        <BucketBottomSheet
+          isVisible={sheetVisible}
+          onClose={() => setSheetVisible(false)}
+          onSelectBucket={handleSelectReclassify}
+          currentBucket={selectedItemInfo?.currentBucket}
+        />
+      </KeyboardAvoidingView>
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  safeContainer: {
+    flex: 1,
+    backgroundColor: '#0a0a0f',
+  },
+  keyboardContainer: {
+    flex: 1,
+  },
+  header: {
+    height: 60,
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#121218',
+    paddingHorizontal: 16,
+    borderBottomWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.05)',
+  },
+  avatar: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    marginRight: 12,
+  },
+  headerInfo: {
+    justifyContent: 'center',
+  },
+  headerTitle: {
+    fontFamily: 'System',
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#ffffff',
+  },
+  headerStatus: {
+    fontFamily: 'System',
+    fontSize: 11,
+    color: '#a855f7',
+    fontWeight: '500',
+  },
+  messagesList: {
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    flexGrow: 1,
+    justifyContent: 'flex-end',
+  },
+  loaderContainer: {
+    flexDirection: 'row',
+    alignSelf: 'flex-start',
+    alignItems: 'center',
+    backgroundColor: '#1c1c24',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.05)',
+    borderRadius: 18,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    marginVertical: 6,
+    gap: 8,
+  },
+  loaderText: {
+    fontFamily: 'System',
+    fontSize: 13,
+    color: 'rgba(255, 255, 255, 0.5)',
+  },
+  historyLoader: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    gap: 12,
+  },
+  historyLoaderText: {
+    fontFamily: 'System',
+    fontSize: 14,
+    color: 'rgba(255, 255, 255, 0.4)',
+  },
+});

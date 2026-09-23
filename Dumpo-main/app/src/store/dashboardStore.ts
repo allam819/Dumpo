@@ -1,0 +1,276 @@
+import { create } from 'zustand';
+import { persist, createJSONStorage } from 'zustand/middleware';
+import { Platform } from 'react-native';
+import * as SecureStore from 'expo-secure-store';
+import { apiRequest } from '../services/api';
+import { supabase } from '../services/supabase';
+import { RealtimeChannel } from '@supabase/supabase-js';
+
+interface DashboardState {
+  todayTasks: any[];
+  somedayTasks: any[];
+  overdueTasks: any[];
+  overdueCount: number;
+  bucketItems: Record<string, any[]>;
+  isLoading: boolean;
+  error: string | null;
+  realtimeChannel: RealtimeChannel | null;
+  
+  fetchDashboard: (currentDate?: string, silent?: boolean) => Promise<void>;
+  fetchBucketItems: (bucketName: string, silent?: boolean) => Promise<void>;
+  toggleTaskComplete: (taskId: string) => Promise<void>;
+  toggleTaskReminder: (taskId: string) => Promise<void>;
+  updateBucketItem: (bucket: string, itemId: string, payload: any) => Promise<void>;
+  reclassifyBucketItem: (bucket: string, itemId: string, toBucket: string) => Promise<void>;
+  deleteBucketItem: (bucket: string, itemId: string) => Promise<void>;
+  subscribeRealtime: (userId: string) => void;
+  unsubscribeRealtime: () => void;
+}
+
+const secureStorage = {
+  getItem: async (name: string): Promise<string | null> => {
+    if (Platform.OS === 'web') {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        return window.localStorage.getItem(name);
+      }
+      return null;
+    }
+    return await SecureStore.getItemAsync(name);
+  },
+  setItem: async (name: string, value: string): Promise<void> => {
+    if (Platform.OS === 'web') {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        window.localStorage.setItem(name, value);
+      }
+      return;
+    }
+    await SecureStore.setItemAsync(name, value);
+  },
+  removeItem: async (name: string): Promise<void> => {
+    if (Platform.OS === 'web') {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        window.localStorage.removeItem(name);
+      }
+      return;
+    }
+    await SecureStore.deleteItemAsync(name);
+  },
+};
+
+export const useDashboardStore = create<DashboardState>()(
+  persist(
+    (set, get) => ({
+      todayTasks: [],
+      somedayTasks: [],
+      overdueTasks: [],
+      overdueCount: 0,
+      bucketItems: {},
+      isLoading: false,
+      error: null,
+      realtimeChannel: null,
+  
+  fetchDashboard: async (currentDate, silent = false) => {
+    if (!silent) set({ isLoading: true });
+    try {
+      const offset = new Date().getTimezoneOffset();
+      const dateParam = currentDate ? `?current_date=${currentDate}&timezone_offset=${offset}` : `?timezone_offset=${offset}`;
+      const response = await apiRequest(`/api/v1/dashboard${dateParam}`, 'GET');
+      
+      set((state) => ({
+        todayTasks: response.today_tasks || [],
+        somedayTasks: response.someday_tasks || [],
+        overdueTasks: response.overdue_tasks || [],
+        overdueCount: response.overdue_count || 0,
+        bucketItems: {
+          ...state.bucketItems,
+          ...(response.ideas_preview ? { ideas: response.ideas_preview } : {}),
+          ...(response.journals_preview ? { journals: response.journals_preview } : {}),
+        },
+        isLoading: false
+      }));
+    } catch (err: any) {
+      set({ error: err.message, isLoading: false });
+    }
+  },
+  
+  fetchBucketItems: async (bucketName: string, silent = false) => {
+    if (!silent) set({ isLoading: true });
+    try {
+      const response = await apiRequest(`/api/v1/buckets/${bucketName}`, 'GET');
+      set((state) => ({
+        bucketItems: {
+          ...state.bucketItems,
+          [bucketName]: response.items || []
+        },
+        isLoading: false
+      }));
+    } catch (err: any) {
+      set({ error: err.message, isLoading: false });
+    }
+  },
+  
+  toggleTaskComplete: async (taskId) => {
+    // Optimistic UI updates
+    const currentToday = [...get().todayTasks];
+    const taskIndex = currentToday.findIndex(t => t.id === taskId);
+    if (taskIndex !== -1) {
+      const isComplete = !currentToday[taskIndex].is_complete;
+      currentToday[taskIndex].is_complete = isComplete;
+      currentToday[taskIndex].completed_at = isComplete ? new Date().toISOString() : null;
+      set({ todayTasks: currentToday });
+    }
+
+    const currentSomeday = [...get().somedayTasks];
+    const somedayIndex = currentSomeday.findIndex(t => t.id === taskId);
+    if (somedayIndex !== -1) {
+      const isComplete = !currentSomeday[somedayIndex].is_complete;
+      currentSomeday[somedayIndex].is_complete = isComplete;
+      currentSomeday[somedayIndex].completed_at = isComplete ? new Date().toISOString() : null;
+      set({ somedayTasks: currentSomeday });
+    }
+    
+    try {
+      await apiRequest(`/api/v1/tasks/${taskId}/complete`, 'PATCH');
+      await get().fetchDashboard(undefined, true);
+    } catch (error) {
+      console.error("Failed to complete task", error);
+      // Revert if API failed
+      await get().fetchDashboard(undefined, true);
+    }
+  },
+  
+  toggleTaskReminder: async (taskId) => {
+    try {
+      await apiRequest(`/api/v1/tasks/${taskId}/reminder`, 'PATCH');
+      await get().fetchDashboard(undefined, true);
+    } catch (error) {
+      console.error("Failed to toggle reminder", error);
+    }
+  },
+  
+  updateBucketItem: async (bucket, itemId, payload) => {
+    try {
+      const res = await apiRequest(`/api/v1/items/${bucket}/${itemId}`, 'PATCH', payload);
+      
+      // If deleted (e.g. user cleared text)
+      if (res.deleted) {
+        set((state) => {
+          const items = (state.bucketItems[bucket] || []).filter(item => item.id !== itemId);
+          return {
+            bucketItems: { ...state.bucketItems, [bucket]: items }
+          };
+        });
+      } else if (res.item) {
+        // Update local state list
+        set((state) => {
+          const items = [...(state.bucketItems[bucket] || [])];
+          const index = items.findIndex(item => item.id === itemId);
+          if (index !== -1) {
+            items[index] = { ...items[index], ...res.item };
+          }
+          return {
+            bucketItems: { ...state.bucketItems, [bucket]: items }
+          };
+        });
+      }
+      
+      // Refresh dashboard if it was a task change
+      if (bucket === "tasks") {
+        await get().fetchDashboard(undefined, true);
+      }
+    } catch (error) {
+      console.error("Failed to update bucket item", error);
+    }
+  },
+  
+  reclassifyBucketItem: async (bucket, itemId, toBucket) => {
+    try {
+      const res = await apiRequest(`/api/v1/items/${bucket}/${itemId}/reclassify`, 'PATCH', {
+        to_bucket: toBucket
+      });
+      
+      if (res.success) {
+        // Remove from source bucket list locally
+        set((state) => {
+          const srcItems = (state.bucketItems[bucket] || []).filter(item => item.id !== itemId);
+          return {
+            bucketItems: {
+              ...state.bucketItems,
+              [bucket]: srcItems
+            }
+          };
+        });
+        
+        // Refresh both source and target buckets
+        await get().fetchBucketItems(bucket);
+        await get().fetchBucketItems(toBucket);
+        await get().fetchDashboard(undefined, true);
+      }
+    } catch (error) {
+      console.error("Failed to reclassify item", error);
+    }
+  },
+  
+  deleteBucketItem: async (bucket, itemId) => {
+    try {
+      await apiRequest(`/api/v1/items/${bucket}/${itemId}`, 'DELETE');
+      set((state) => {
+        const items = (state.bucketItems[bucket] || []).filter(item => item.id !== itemId);
+        return {
+          bucketItems: { ...state.bucketItems, [bucket]: items }
+        };
+      });
+      await get().fetchDashboard(undefined, true);
+    } catch (error) {
+      console.error("Failed to delete item", error);
+    }
+  },
+  
+  subscribeRealtime: (userId) => {
+    if (get().realtimeChannel) return; // Already subscribed
+    
+    const tables = ["tasks", "ideas", "journals", "finance", "health", "watchlist", "others"];
+    
+    let channel = supabase.channel('dashboard-changes');
+    
+    // Bind change listener for every table
+    tables.forEach((table) => {
+      channel = channel.on(
+        'postgres_changes' as any,
+        { event: '*', schema: 'public', table: table, filter: `user_id=eq.${userId}` },
+        (payload) => {
+          // Trigger silent background refresh
+          get().fetchDashboard(undefined, true);
+          // Also refresh any cached bucket lists
+          const cachedBuckets = Object.keys(get().bucketItems);
+          if (cachedBuckets.includes(table)) {
+            get().fetchBucketItems(table);
+          }
+        }
+      );
+    });
+    
+    const activeChannel = channel.subscribe();
+    set({ realtimeChannel: activeChannel });
+  },
+      unsubscribeRealtime: () => {
+        const { realtimeChannel } = get();
+        if (realtimeChannel) {
+          supabase.removeChannel(realtimeChannel);
+          set({ realtimeChannel: null });
+        }
+      }
+    }),
+    {
+      name: 'dashboard-storage',
+      storage: createJSONStorage(() => secureStorage),
+      partialize: (state) => ({
+        todayTasks: state.todayTasks,
+        somedayTasks: state.somedayTasks,
+        overdueTasks: state.overdueTasks,
+        overdueCount: state.overdueCount,
+        bucketItems: state.bucketItems,
+      }), // only persist data, not loading states or realtime channels
+    }
+  )
+);
